@@ -12,6 +12,7 @@ import (
 	"errors"
 	"crypto/rand"
 	"io"
+	"fmt"
 )
 
 /**
@@ -23,10 +24,10 @@ type AESReader struct {
 	ds *bufio.Reader
 	//Handles data which doesn't fit to chunk size
 	nRem int
-	rem []byte
+	rem  []byte
 	//For performing decryption of the data
 	block cipher.Block
-	mode cipher.BlockMode
+	mode  cipher.BlockMode
 }
 
 /**
@@ -38,10 +39,10 @@ type AESWriter struct {
 	ds io.Writer
 	//Handles data which doesn't fit to chunk size
 	nRem int
-	rem []byte
+	rem  []byte
 	//For performing encryption of the data
 	block cipher.Block
-	mode cipher.BlockMode
+	mode  cipher.BlockMode
 }
 
 /**
@@ -140,6 +141,29 @@ func DecryptString(s string, key []byte) (string, error) {
 }
 
 /**
+ * Initialize a new AESWriter, need given key & iv
+ * Act different with #NewWriter, it does not generate iv AND dont write IV to first block.
+ * Use NewReaderWithIV for decryption.
+ */
+func NewWriterWithIV(w io.Writer, k, iv []byte) (*AESWriter, error) {
+	//Key must be of length 16, 24 or 32 bytes
+	if len(k) != 16 && len(k) != 24 && len(k) != 32 {
+		return nil, errors.New("Key must be of length 16, 24, or 32.")
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, errors.New(fmt.Sprintf("need %v size IV", aes.BlockSize))
+	}
+
+	//Create a new block cipher from the key and IV
+	blk, err := aes.NewCipher(k)
+	if err != nil {
+		return nil, err
+	}
+	mde := cipher.NewCBCEncrypter(blk, iv)
+	return &AESWriter{ds: w, rem: make([]byte, aes.BlockSize), block: blk, mode: mde}, nil
+}
+
+/**
  * Initialize a new AESWriter, generate an IV and write it to
  * the stream.
  */
@@ -192,8 +216,8 @@ func (w *AESWriter) Write(b []byte) (nw int, err error) {
 	//The amount that will actually be written including any existing remainder
 	roundSize := ((len(b) + w.nRem) / aes.BlockSize) * aes.BlockSize
 	//Actual amount of b to actually write on this call
-	nbw := Max(roundSize - w.nRem, 0)
-	if roundSize > 0 {	//Prevent any index out of bounds errors
+	nbw := Max(roundSize-w.nRem, 0)
+	if roundSize > 0 { //Prevent any index out of bounds errors
 		//Temporary buffer capable of holding remainder plus data from b
 		buf := make([]byte, roundSize)
 		//Copy any remaining data to temp buffer
@@ -211,6 +235,32 @@ func (w *AESWriter) Write(b []byte) (nw int, err error) {
 	copy(w.rem[w.nRem:], b[nbw:])
 	w.nRem += (len(b) - nbw)
 	return len(b), nil
+}
+
+/**
+ * Initialize a new AESReader, need given key & iv
+ * Act different with #NewReader, it does not read iv from reader
+ * Use NewWriterWithIV for encryption.
+ */
+func NewReaderWithIV(r io.Reader, k, iv []byte) (*AESReader, error) {
+
+	//Key must be of length 16, 24 or 32 bytes
+	if len(k) != 16 && len(k) != 24 && len(k) != 32 {
+		return nil, errors.New("Key must be of length 16, 24, or 32.")
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, errors.New(fmt.Sprintf("need %v size IV", aes.BlockSize))
+	}
+	//Needed to peek on the input stream in Read
+	br := bufio.NewReader(r)
+
+	//Create a new block cipher from the key and IV
+	blk, err := aes.NewCipher(k)
+	if err != nil {
+		return nil, err
+	}
+	mde := cipher.NewCBCDecrypter(blk, iv)
+	return &AESReader{ds: br, rem: make([]byte, aes.BlockSize), block: blk, mode: mde}, nil
 }
 
 /**
@@ -254,20 +304,20 @@ func (r *AESReader) Read(b []byte) (n int, err error) {
 	//Update the remainder variabales
 	copy(r.rem, r.rem[nr:])
 	r.nRem -= nr
-	if roundSize > 0 {	//Only necessary if buffer wasn't filled yet
+	if roundSize > 0 { //Only necessary if buffer wasn't filled yet
 		//Need to read and decode another chunk to fill b
 		buf := make([]byte, roundSize)
 		n, err = io.ReadFull(r.ds, buf)
 		//Data was read but didn't fill roundSize; this might be okay
 		if err == io.ErrUnexpectedEOF && n > 0 {
-			err = nil	//Supress the error
+			err = nil //Supress the error
 		} else if (err == io.EOF && n == 0) {
 			return nr, err //Valid EOF detected; notify caller end was reached
 		} else if err != nil {
 			return nr, err //Some other error occured
 		}
 		//Perform the decryption; valid stream will be a multiple of block length
-		if n % aes.BlockSize != 0 {
+		if n%aes.BlockSize != 0 {
 			return nr, errors.New("Stream is not a valid AESRW stream.")
 		}
 		r.mode.CryptBlocks(buf[0:n], buf[0:n])
@@ -277,7 +327,7 @@ func (r *AESReader) Read(b []byte) (n int, err error) {
 		if err != nil {
 			//Last block read contains padding that must be removed
 			//Last byte indicates the amount of padding added by AESWriter
-			nPad := int(buf[n - 1])
+			nPad := int(buf[n-1])
 			n -= nPad
 		}
 		//Test if invalid padding value was supplied
